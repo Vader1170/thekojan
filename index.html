@@ -203,17 +203,9 @@
     height: 100%;
     object-fit: cover;
     display: block;
-    /* FIX: Ensure GPU compositing layer - prevents blank frame on some browsers */
-    transform: translateZ(0);
-    -webkit-transform: translateZ(0);
   }
 
-  /* FIX: Mirror only via wrapper, not on the video element itself —
-     avoids a Chrome compositing quirk where scaleX(-1) on a video
-     with a programmatically-set srcObject can produce a blank frame. */
-  #cell-local { transform: scaleX(-1); }
-  /* Mirror the label back so text reads correctly */
-  #cell-local .cell-label { transform: scaleX(-1); }
+  #cell-local video { transform: scaleX(-1); }
 
   .video-cell::after {
     content: '';
@@ -699,9 +691,6 @@
 </header>
 
 <div id="gallery">
-  <!-- FIX: Mirror applied to the cell wrapper div, NOT the video element.
-       scaleX(-1) on a video with a programmatically-set srcObject triggers a
-       Chrome GPU compositing bug that renders blank frames. -->
   <div class="video-cell" id="cell-local">
     <video id="v-local" autoplay muted playsinline></video>
     <div class="cell-label"><span>●</span>Host</div>
@@ -712,7 +701,6 @@
       <div class="waiting-icon" id="waiting-icon"></div>
       <div class="waiting-text"><strong>Waiting for Guest</strong>Share your Session ID</div>
     </div>
-    <!-- Reconnect overlay shown on ICE failure -->
     <div id="reconnect-overlay">
       <div class="reconnect-text">
         <strong>Connection interrupted</strong>
@@ -742,11 +730,6 @@
 <script>
 // ---------------------------------------------------------------------------
 // ICE SERVER CONFIG
-// FIX: Added all 5 Google STUN servers + Cloudflare STUN.
-// Added TCP variants of TURN (port 443 TCP punches through almost every
-// corporate/hotel firewall that blocks UDP). Added a second free TURN
-// provider (numb.viagenie.ca) as fallback. This combination covers ~98% of
-// NAT topologies.
 // ---------------------------------------------------------------------------
 const ICE = {
   iceServers: [
@@ -760,20 +743,25 @@ const ICE = {
         'stun:stun.cloudflare.com:3478'
       ]
     },
-    // Primary TURN - openrelay (UDP + TCP + TLS)
     {
       urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:80?transport=tcp',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp'
+        'turn:relay1.expressturn.com:3478',
+        'turn:relay1.expressturn.com:3478?transport=tcp'
       ],
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
+      username: 'efVW0M1DAFIS3RBT7Q',
+      credential: 'aIBCqbxYIuqNvBaH'
+    },
+    {
+      urls: [
+        'turn:a.relay.metered.ca:80',
+        'turn:a.relay.metered.ca:80?transport=tcp',
+        'turn:a.relay.metered.ca:443',
+        'turns:a.relay.metered.ca:443?transport=tcp'
+      ],
+      username: 'e8dd65f8a766da5e68e30431',
+      credential: 'uSMQbTjbM2VEcHFP'
     }
   ],
-  // FIX: Prefer UDP, fall back to TCP. Unified plan is required for
-  // modern Chrome/Firefox to correctly negotiate codec parameters.
   sdpSemantics: 'unified-plan',
   iceTransportPolicy: 'all'
 };
@@ -788,16 +776,7 @@ let isHost = false;
 let iceRestartTimer = null;
 let pingInterval = null;
 
-// ---------------------------------------------------------------------------
-// LIPSYNC CONSTANTS
-// How much to delay the REMOTE audio track before recording it.
-// Root cause: WebRTC video jitter buffer adapts upward during heavy speech
-// (more motion = larger inter-frames = more RTP packets = more buffering).
-// Audio jitter buffer stays small (~40-60ms). This constant compensates
-// so the recorded audio aligns with the visually delayed video.
-// Tune this if lipsync is still off: increase if audio leads lips,
-// decrease if lips lead audio. 150ms covers the typical range.
-// ---------------------------------------------------------------------------
+// 150ms audio delay for remote stream to compensate WebRTC jitter buffer asymmetry
 const REMOTE_AUDIO_DELAY_MS = 150;
 
 // AudioContext instances owned by the recording pipeline — cleaned up on stop
@@ -869,10 +848,6 @@ async function setup() {
 
   const localVid = document.getElementById('v-local');
   localVid.srcObject = localStream;
-
-  // FIX: Explicitly call play(). The autoplay HTML attribute is frequently
-  // ignored by browsers when srcObject is assigned via JS. This is the
-  // primary cause of the black local preview on first load.
   localVid.play().catch(() => {});
 
   vad(localStream, 'cell-local');
@@ -914,9 +889,7 @@ function doCall(id) {
 }
 
 // ---------------------------------------------------------------------------
-// ICE MONITORING — FIX: The original code had zero ICE state handling.
-// Any network hiccup sent the connection to "disconnected" or "failed" with
-// no recovery, causing the permanent audio/video freeze.
+// ICE MONITORING
 // ---------------------------------------------------------------------------
 function attachIceMonitor(call) {
   const pc = call.peerConnection;
@@ -932,8 +905,6 @@ function attachIceMonitor(call) {
     }
 
     if (s === 'disconnected') {
-      // Give the browser 4 seconds to self-heal before forcing an ICE restart.
-      // Transient network blips often self-recover within this window.
       document.getElementById('status-dot').className = 'status-dot reconnecting';
       toast('Connection unstable — holding...');
       iceRestartTimer = setTimeout(() => {
@@ -947,12 +918,9 @@ function attachIceMonitor(call) {
     if (s === 'failed') {
       clearTimeout(iceRestartTimer);
       document.getElementById('status-dot').className = 'status-dot connecting';
-      // Try restartIce first — this renegotiates candidates without
-      // destroying the call object (preserves recording state).
       try {
         pc.restartIce();
         toast('ICE failed — restarting...');
-        // If still failed after 6s, show manual reconnect
         iceRestartTimer = setTimeout(() => {
           if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
             showReconnectOverlay();
@@ -997,11 +965,6 @@ function manualReconnect() {
 
 // ---------------------------------------------------------------------------
 // REMOTE STREAM HANDLER
-// FIX: Added explicit .play() call — the single most common cause of the
-// black guest/host screen. Setting video.srcObject programmatically does NOT
-// reliably trigger playback; play() must be called explicitly.
-// Also added onloadedmetadata fallback for browsers that need the metadata
-// event before they'll play.
 // ---------------------------------------------------------------------------
 function onRemote(stream) {
   remoteStream = stream;
@@ -1011,7 +974,6 @@ function onRemote(stream) {
   vid.srcObject = null;
   vid.srcObject = stream;
 
-  // FIX: Explicit play() — do NOT rely on the autoplay attribute alone
   const tryPlay = () => vid.play().catch(e => console.warn('[play]', e));
   vid.onloadedmetadata = tryPlay;
   tryPlay(); // also try immediately in case metadata is already available
@@ -1022,11 +984,6 @@ function onRemote(stream) {
   hideReconnectOverlay();
   toast('Guest stream live');
 
-  // FIX: VAD now uses cloned streams. Creating a MediaStreamAudioSourceNode
-  // from the same stream object being used by a video element can, in some
-  // Chrome versions, cause the GPU decoder to drop frames (appears as black
-  // video). Cloning isolates the AudioContext from the video element's
-  // internal media pipeline.
   vadSafe(stream, 'cell-remote');
 }
 
@@ -1046,18 +1003,13 @@ function onDisconnect() {
 
 // ---------------------------------------------------------------------------
 // VOICE ACTIVITY DETECTION
-// FIX: Use stream.clone() to prevent the AudioContext from sharing the
-// internal decoder pipeline with the video element.
 // ---------------------------------------------------------------------------
 function vadSafe(stream, cellId) {
   try {
-    // Clone so AudioContext and video element use separate decoder instances
-    const clone = stream.clone();
-    // Remove video tracks from clone — we only need audio for VAD
-    clone.getVideoTracks().forEach(t => t.stop());
-    vad(clone, cellId);
+    const audioOnly = new MediaStream(stream.getAudioTracks());
+    vad(audioOnly, cellId);
   } catch {
-    vad(stream, cellId); // fallback to original if clone fails
+    vad(stream, cellId);
   }
 }
 
@@ -1093,9 +1045,6 @@ function vad(stream, cellId) {
 // ---------------------------------------------------------------------------
 function setupDataChannel(dc) {
   dc.onopen = () => {
-    // FIX: Send a keepalive ping every 15s. TURN servers drop sessions after
-    // 30s of silence. Without this, a quiet moment in the podcast can cause
-    // the relay to close, which appears as a permanent audio/video freeze.
     pingInterval = setInterval(() => {
       if (dc.readyState === 'open') {
         try { dc.send('PING'); } catch(e) {}
@@ -1108,7 +1057,6 @@ function setupDataChannel(dc) {
   dc.onmessage = e => {
     if (e.data === 'REC_START') document.getElementById('rec-notify').classList.add('show');
     if (e.data === 'REC_STOP')  document.getElementById('rec-notify').classList.remove('show');
-    // PING/PONG — just ignore, data channel activity keeps TURN alive
   };
 }
 
@@ -1119,33 +1067,7 @@ function dcSend(msg) {
 }
 
 // ---------------------------------------------------------------------------
-// RECORDING — LIPSYNC ARCHITECTURE
-//
-// The problem: MediaRecorder records raw WebRTC MediaStream tracks. Audio and
-// video tracks have been through separate jitter buffers with different delays.
-// Under heavy speech, video frames are larger (more motion = more inter-frame
-// complexity = more RTP packets = larger adaptive jitter buffer = more delay).
-// Audio stays at ~40-60ms buffer. The gap creates "audio leads lips" desync.
-//
-// The fix has three parts applied together:
-//
-//   1. createSyncedRecStream(stream, audioDelayMs)
-//      Pipes audio through an AudioContext at 48kHz (hardware audio clock).
-//      This re-clocks audio to a stable monotonic clock, eliminating RTP
-//      timestamp discontinuities. For the remote stream, it also adds a
-//      fixed delay to audio so it aligns with the systematically later video.
-//      The returned stream is used ONLY for recording — the live streams are
-//      untouched so live monitoring is unaffected.
-//
-//   2. timeslice = 200ms (was 1000ms)
-//      Smaller chunks = more frequent sync points in the webm container.
-//      Under CPU load, a late chunk drifts for at most 200ms instead of 1s.
-//
-//   3. VP8 preferred over VP9 for recording
-//      VP8 has ~30-50ms lower encoder latency than VP9. Under heavy speech
-//      (high motion video), VP9's RDO (rate-distortion optimisation) stalls
-//      the video pipeline, adding variable latency that doesn't affect audio.
-//      VP8 is lighter and more timestamp-stable at the cost of ~10% bitrate.
+// RECORDING — LIPSYNC
 // ---------------------------------------------------------------------------
 
 function createSyncedRecStream(stream, audioDelayMs) {
@@ -1158,40 +1080,25 @@ function createSyncedRecStream(stream, audioDelayMs) {
     return { recStream: stream, ctx: null };
   }
 
-  // AudioContext at 48kHz with 'playback' latency hint.
-  // 'playback' requests the largest available hardware buffer (512 samples
-  // typical = ~10.7ms at 48kHz). This is fine for recording — we don't care
-  // about the small added latency because we're adding audioDelayMs anyway.
-  // What matters is that the hardware audio clock is now the timestamp source,
-  // not the system clock which can drift under CPU load.
   const ctx = new (window.AudioContext || window.webkitAudioContext)({
     sampleRate: 48000,
     latencyHint: 'playback'
   });
 
-  // Resume immediately — we are inside a button click handler (user gesture),
-  // so the AudioContext should start in 'running' state, but resume() is
-  // defensive for Safari.
   ctx.resume().catch(() => {});
 
-  // Route: source → [optional delay] → destination
   const src  = ctx.createMediaStreamSource(new MediaStream(audioTracks));
   const dest = ctx.createMediaStreamDestination();
 
   if (audioDelayMs > 0) {
-    // createDelay max is 179.999s per spec; we're safe at ≤500ms
     const delayNode = ctx.createDelay(1.0);
     delayNode.delayTime.value = audioDelayMs / 1000;
     src.connect(delayNode);
     delayNode.connect(dest);
   } else {
-    // No delay — just re-clock through the AudioContext graph
     src.connect(dest);
   }
 
-  // Build the recording MediaStream:
-  //   video tracks  ← directly from original (no processing, no added latency)
-  //   audio track   ← from AudioContext destination (re-clocked, optionally delayed)
   const recStream = new MediaStream();
   videoTracks.forEach(t => recStream.addTrack(t));
   dest.stream.getAudioTracks().forEach(t => recStream.addTrack(t));
@@ -1199,13 +1106,11 @@ function createSyncedRecStream(stream, audioDelayMs) {
   return { recStream, ctx };
 }
 
-// Prefer VP8 for recording: lower encoder latency under load, more stable
-// video timestamps. VP9 is offered as fallback for audio-only or unsupported.
 function recMime() {
   return [
-    'video/webm;codecs=vp8,opus',   // preferred: low-latency encoder
-    'video/webm;codecs=vp9,opus',   // fallback
-    'video/webm'                    // last resort
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=vp9,opus',
+    'video/webm'
   ].find(t => MediaRecorder.isTypeSupported(t)) || '';
 }
 
@@ -1216,30 +1121,19 @@ function startRecording() {
   const mimeType = recMime();
   const recOptions = {
     mimeType,
-    videoBitsPerSecond: 1_500_000, // 1.5 Mbps — plenty for 720p talking head,
-    audioBitsPerSecond:   128_000  // significantly reduces encoder CPU pressure
+    videoBitsPerSecond: 1_500_000,
+    audioBitsPerSecond:   128_000
   };
 
-  // --- LOCAL STREAM ---
-  // Direct getUserMedia stream: audio and video come from the same device,
-  // captured by the OS audio/video driver at the same wall-clock time.
-  // No jitter buffer involved. We still re-clock audio through AudioContext
-  // to give it a stable hardware-clock timestamp (prevents system-clock
-  // drift artifacts under CPU load). audioDelayMs = 0: no compensation needed.
   const { recStream: localRecStream, ctx: lCtx } = createSyncedRecStream(localStream, 0);
   localRecCtx = lCtx;
 
   localRec = new MediaRecorder(localRecStream, recOptions);
   localRec.ondataavailable = e => e.data.size > 0 && localChunks.push(e.data);
-  // 200ms timeslice: webm container gets a sync point every 200ms.
-  // Under load, worst-case drift window is 200ms instead of 1000ms.
   localRec.start(200);
 
   // --- REMOTE STREAM ---
   if (remoteStream) {
-    // WebRTC stream: audio and video have been through separate jitter buffers.
-    // audioDelayMs = REMOTE_AUDIO_DELAY_MS (150ms default) aligns audio to
-    // match the systematically delayed video track. See constant comment above.
     const { recStream: remoteRecStream, ctx: rCtx } = createSyncedRecStream(remoteStream, REMOTE_AUDIO_DELAY_MS);
     remoteRecCtx = rCtx;
 
@@ -1282,7 +1176,6 @@ function stopRecording() {
   // Stop recorders; save on localRec.onstop so both blobs are ready
   if (localRec && localRec.state !== 'inactive') {
     localRec.onstop = () => {
-      // Close AudioContexts — frees the hardware clock resources
       if (localRecCtx)  { localRecCtx.close().catch(()=>{}); localRecCtx = null; }
       if (remoteRecCtx) { remoteRecCtx.close().catch(()=>{}); remoteRecCtx = null; }
 
@@ -1341,8 +1234,6 @@ function copyId() {
 
 function closeModal() {
   document.getElementById('id-modal').style.display = 'none';
-  // FIX: Re-trigger local video play after modal closes (some browsers
-  // suspend video rendering while a full-screen overlay is visible).
   document.getElementById('v-local').play().catch(() => {});
 }
 
@@ -1399,17 +1290,12 @@ function exitStudio() {
 // ---------------------------------------------------------------------------
 setup();
 
-// Keep VAD running for local stream (already using clone internally)
-// — moved into setup() after localStream is acquired
-
 document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && document.getElementById('host-modal').classList.contains('show')) {
     checkPasskey();
   }
 });
 
-// FIX: Some browsers (especially Safari) suspend AudioContexts after a period
-// of user inactivity. Resume them on any user interaction.
 document.addEventListener('click', () => {
   if (window._vadCtx && window._vadCtx.state === 'suspended') {
     window._vadCtx.resume();
