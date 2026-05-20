@@ -776,8 +776,10 @@ let isHost = false;
 let iceRestartTimer = null;
 let pingInterval = null;
 
-// 150ms audio delay for remote stream to compensate WebRTC jitter buffer asymmetry
-const REMOTE_AUDIO_DELAY_MS = 150;
+// Audio delay applied to the REMOTE recording to align with the video jitter buffer.
+// If audio leads lips → increase. If lips move before audio → decrease.
+// Typical range: 200–350ms depending on network conditions.
+const REMOTE_AUDIO_DELAY_MS = 250;
 
 // AudioContext instances owned by the recording pipeline — cleaned up on stop
 let localRecCtx  = null;
@@ -833,7 +835,7 @@ function initPeer() {
 async function setup() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, min: 15 } },
       audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 }
     });
   } catch {
@@ -1119,16 +1121,21 @@ function startRecording() {
   localChunks = []; remoteChunks = [];
 
   const mimeType = recMime();
-  const recOptions = {
+  const localRecOptions = {
     mimeType,
-    videoBitsPerSecond: 1_500_000,
+    videoBitsPerSecond: 2_500_000,
+    audioBitsPerSecond:   128_000
+  };
+  const remoteRecOptions = {
+    mimeType,
+    videoBitsPerSecond: 4_000_000,
     audioBitsPerSecond:   128_000
   };
 
   const { recStream: localRecStream, ctx: lCtx } = createSyncedRecStream(localStream, 0);
   localRecCtx = lCtx;
 
-  localRec = new MediaRecorder(localRecStream, recOptions);
+  localRec = new MediaRecorder(localRecStream, localRecOptions);
   localRec.ondataavailable = e => e.data.size > 0 && localChunks.push(e.data);
   localRec.start(200);
 
@@ -1137,7 +1144,7 @@ function startRecording() {
     const { recStream: remoteRecStream, ctx: rCtx } = createSyncedRecStream(remoteStream, REMOTE_AUDIO_DELAY_MS);
     remoteRecCtx = rCtx;
 
-    remoteRec = new MediaRecorder(remoteRecStream, recOptions);
+    remoteRec = new MediaRecorder(remoteRecStream, remoteRecOptions);
     remoteRec.ondataavailable = e => e.data.size > 0 && remoteChunks.push(e.data);
     remoteRec.start(200);
   }
