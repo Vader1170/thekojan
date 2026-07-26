@@ -47,7 +47,7 @@ let isHost = false;
 const connections = new Map();
 
 // Recording state
-let recordings = [];       // Array of { localRec, localChunks, label, ctx }
+let recordings = [];       // Array of { rec, chunks, label }
 let timerInterval = null;
 let timerSecs = 0;
 
@@ -61,8 +61,6 @@ let pendingSlots = 2;
 
 // Keep-alive: re-negotiate every 25 min to prevent WebRTC stale-stream freeze
 const KEEPALIVE_RENEGOTIATE_MS = 25 * 60 * 1000;
-// Audio delay to compensate jitter buffer asymmetry
-const REMOTE_AUDIO_DELAY_MS = 150;
 
 let toastTimer = null;
 
@@ -563,35 +561,18 @@ function recMime() {
   ].find(t => MediaRecorder.isTypeSupported(t)) || '';
 }
 
-function createSyncedRecStream(stream, delayMs) {
-  const audioTracks = stream.getAudioTracks();
-  const videoTracks = stream.getVideoTracks();
-
-  if (!audioTracks.length) return { recStream: stream, ctx: null };
-
-  const ctx = new (window.AudioContext || window.webkitAudioContext)({
-    sampleRate: 48000,
-    latencyHint: 'playback'
-  });
-  ctx.resume().catch(() => {});
-
-  const src  = ctx.createMediaStreamSource(new MediaStream(audioTracks));
-  const dest = ctx.createMediaStreamDestination();
-
-  if (delayMs > 0) {
-    const delay = ctx.createDelay(1.0);
-    delay.delayTime.value = delayMs / 1000;
-    src.connect(delay);
-    delay.connect(dest);
-  } else {
-    src.connect(dest);
-  }
-
+// Record straight from the live MediaStreamTracks with no AudioContext
+// re-routing. Piping audio through an AudioContext (createMediaStreamSource
+// → DelayNode → createMediaStreamDestination) resamples it onto the
+// AudioContext's own hardware clock; on many browser/OS combos that clock
+// drifts slightly from the track's native clock, which is what caused the
+// lower pitch and creeping lag. Recording the tracks directly avoids the
+// resample entirely, and MediaRecorder timestamps stay tied to the source.
+function buildRecStream(stream) {
   const recStream = new MediaStream();
-  videoTracks.forEach(t => recStream.addTrack(t));
-  dest.stream.getAudioTracks().forEach(t => recStream.addTrack(t));
-
-  return { recStream, ctx };
+  stream.getVideoTracks().forEach(t => recStream.addTrack(t));
+  stream.getAudioTracks().forEach(t => recStream.addTrack(t));
+  return recStream;
 }
 
 function startRecording() {
@@ -601,28 +582,28 @@ function startRecording() {
   const mimeType = recMime();
   const opts = {
     mimeType,
-    videoBitsPerSecond: 1_500_000,
-    audioBitsPerSecond: 128_000
+    videoBitsPerSecond: 2_500_000,
+    audioBitsPerSecond: 160_000
   };
 
   // Local track
-  const { recStream: localRecStream, ctx: lCtx } = createSyncedRecStream(localStream, 0);
-  const localRec = new MediaRecorder(localRecStream, opts);
+  const localRec = new MediaRecorder(buildRecStream(localStream), opts);
   const localChunks = [];
   localRec.ondataavailable = e => e.data.size > 0 && localChunks.push(e.data);
-  localRec.start(200);
-  recordings.push({ rec: localRec, chunks: localChunks, label: 'Kojan_Host', ctx: lCtx });
+  localRec.onerror = e => console.error('[Recorder:local]', e.error || e);
+  localRec.start(1000);
+  recordings.push({ rec: localRec, chunks: localChunks, label: 'Kojan_Host' });
 
   // Remote tracks
   for (const [, entry] of connections) {
     if (!entry.stream) continue;
-    const { recStream, ctx: rCtx } = createSyncedRecStream(entry.stream, REMOTE_AUDIO_DELAY_MS);
-    const remoteRec = new MediaRecorder(recStream, opts);
+    const remoteRec = new MediaRecorder(buildRecStream(entry.stream), opts);
     const remoteChunks = [];
     remoteRec.ondataavailable = e => e.data.size > 0 && remoteChunks.push(e.data);
-    remoteRec.start(200);
+    remoteRec.onerror = e => console.error('[Recorder:remote]', e.error || e);
+    remoteRec.start(1000);
     const safeName = entry.label.replace(/\s+/g, '_');
-    recordings.push({ rec: remoteRec, chunks: remoteChunks, label: `Kojan_${safeName}`, ctx: rCtx });
+    recordings.push({ rec: remoteRec, chunks: remoteChunks, label: `Kojan_${safeName}` });
   }
 
   const btn = document.getElementById('btn-start');
@@ -663,112 +644,13 @@ function stopRecording() {
     if (track.rec.state === 'inactive') continue;
 
     track.rec.onstop = () => {
-      if (track.ctx) { track.ctx.close().catch(() => {}); }
       const blob = new Blob(track.chunks, { type: 'video/webm' });
-      tryExportMp4(blob, track.label);
+      saveBlob(blob, `${track.label}.webm`);
       pending--;
       if (pending === 0) toast(`Saved ${recordings.length} track(s)`);
     };
     track.rec.stop();
   }
-}
-
-// ── MP4 EXPORT (via canvas re-mux if supported) ──────────────────────────────
-// Browsers cannot natively encode MP4 from MediaRecorder. The industry
-// standard workaround for a pure-browser solution is to download WebM and
-// convert offline. However, we attempt to use the VideoEncoder API (available
-// in Chrome 94+ / Edge 94+) for direct MP4 container output, and fall back
-// gracefully to WebM download everywhere else.
-
-async function tryExportMp4(blob, baseName) {
-  // Prefer mp4 if the browser can produce it
-  if (MediaRecorder.isTypeSupported('video/mp4;codecs=avc1,mp4a.40.2')) {
-    // Browser already recorded mp4 — name accordingly
-    saveBlob(blob, `${baseName}.mp4`);
-    return;
-  }
-
-  // VideoEncoder path (Chrome 94+, Edge 94+)
-  if (typeof VideoEncoder !== 'undefined' && typeof VideoDecoder !== 'undefined') {
-    toast('Converting to MP4…');
-    try {
-      const mp4Blob = await webmToMp4ViaWebCodecs(blob);
-      if (mp4Blob) {
-        saveBlob(mp4Blob, `${baseName}.mp4`);
-        return;
-      }
-    } catch(e) {
-      console.warn('[MP4]', e);
-    }
-  }
-
-  // Fallback: download WebM and note instructions
-  saveBlob(blob, `${baseName}.webm`);
-  toast('Saved as WebM (convert offline with ffmpeg or handbrake)');
-}
-
-async function webmToMp4ViaWebCodecs(webmBlob) {
-  // Decode frames from the WebM blob and re-encode as H.264 in an MP4 container.
-  // We use the MediaSource + drawImage approach since a proper MP4 muxer
-  // requires a third-party library. This returns null if anything goes wrong
-  // so the caller can fall back to WebM.
-
-  return new Promise((resolve) => {
-    const url = URL.createObjectURL(webmBlob);
-    const video = document.createElement('video');
-    video.src = url;
-    video.muted = true;
-
-    video.onloadedmetadata = () => {
-      const { videoWidth: w, videoHeight: h, duration } = video;
-      if (!w || !h || !isFinite(duration)) { resolve(null); return; }
-
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-
-      const stream = canvas.captureStream(30);
-
-      // Try to capture audio from the video
-      try {
-        const actx = new AudioContext();
-        const src = actx.createMediaElementSource(video);
-        const dest = actx.createMediaStreamDestination();
-        src.connect(dest);
-        dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
-      } catch(e) {}
-
-      const mime = MediaRecorder.isTypeSupported('video/mp4;codecs=avc1,mp4a.40.2')
-        ? 'video/mp4;codecs=avc1,mp4a.40.2'
-        : MediaRecorder.isTypeSupported('video/mp4') ? 'video/mp4' : null;
-
-      if (!mime) { resolve(null); return; }
-
-      const chunks = [];
-      const mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2_000_000 });
-      mr.ondataavailable = e => e.data.size > 0 && chunks.push(e.data);
-      mr.onstop = () => {
-        URL.revokeObjectURL(url);
-        resolve(new Blob(chunks, { type: 'video/mp4' }));
-      };
-
-      mr.start(200);
-      video.currentTime = 0;
-      video.play();
-
-      (function drawFrame() {
-        if (video.ended || video.currentTime >= duration) {
-          mr.stop();
-          return;
-        }
-        ctx.drawImage(video, 0, 0, w, h);
-        requestAnimationFrame(drawFrame);
-      })();
-    };
-
-    video.onerror = () => resolve(null);
-  });
 }
 
 function saveBlob(blob, name) {
