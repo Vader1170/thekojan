@@ -67,7 +67,7 @@ let toastTimer = null;
 // ── GALLERY LAYOUT ──────────────────────────────────────────────────────────
 
 function totalCells() {
-  return 1 + connections.size;
+  return document.querySelectorAll('#gallery .video-cell:not(.placeholder)').length;
 }
 
 function applyLayout() {
