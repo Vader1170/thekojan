@@ -575,10 +575,39 @@ function buildRecStream(stream) {
   return recStream;
 }
 
+// Chrome stops pumping frames into a MediaStream that was built with
+// `new MediaStream()` + addTrack() once nothing is actively consuming it —
+// the on-screen <video> elements are rendering the ORIGINAL stream objects
+// (localStream / entry.stream), not this new wrapper, so the wrapper gets
+// starved a few seconds in: MediaRecorder keeps writing audio but the video
+// track stops advancing, which looks exactly like a freeze. Attaching each
+// wrapper to its own (invisible) <video> and playing it keeps Chrome's
+// frame pump alive for the whole recording.
+const recSinks = [];
+
+function attachRecSink(stream) {
+  const v = document.createElement('video');
+  v.srcObject = stream;
+  v.muted = true;
+  v.playsInline = true;
+  v.style.cssText = 'position:fixed;top:0;left:0;width:2px;height:2px;opacity:0;pointer-events:none;';
+  document.body.appendChild(v);
+  v.play().catch(() => {});
+  return v;
+}
+
+function clearRecSinks() {
+  while (recSinks.length) {
+    const v = recSinks.pop();
+    try { v.srcObject = null; v.remove(); } catch (e) {}
+  }
+}
+
 function startRecording() {
   if (!localStream) { toast('No stream'); return; }
 
   recordings = [];
+  clearRecSinks();
   const mimeType = recMime();
   const opts = {
     mimeType,
@@ -587,7 +616,9 @@ function startRecording() {
   };
 
   // Local track
-  const localRec = new MediaRecorder(buildRecStream(localStream), opts);
+  const localRecStream = buildRecStream(localStream);
+  recSinks.push(attachRecSink(localRecStream));
+  const localRec = new MediaRecorder(localRecStream, opts);
   const localChunks = [];
   localRec.ondataavailable = e => e.data.size > 0 && localChunks.push(e.data);
   localRec.onerror = e => console.error('[Recorder:local]', e.error || e);
@@ -597,7 +628,9 @@ function startRecording() {
   // Remote tracks
   for (const [, entry] of connections) {
     if (!entry.stream) continue;
-    const remoteRec = new MediaRecorder(buildRecStream(entry.stream), opts);
+    const remoteRecStream = buildRecStream(entry.stream);
+    recSinks.push(attachRecSink(remoteRecStream));
+    const remoteRec = new MediaRecorder(remoteRecStream, opts);
     const remoteChunks = [];
     remoteRec.ondataavailable = e => e.data.size > 0 && remoteChunks.push(e.data);
     remoteRec.onerror = e => console.error('[Recorder:remote]', e.error || e);
@@ -647,7 +680,10 @@ function stopRecording() {
       const blob = new Blob(track.chunks, { type: 'video/webm' });
       saveBlob(blob, `${track.label}.webm`);
       pending--;
-      if (pending === 0) toast(`Saved ${recordings.length} track(s)`);
+      if (pending === 0) {
+        clearRecSinks();
+        toast(`Saved ${recordings.length} track(s)`);
+      }
     };
     track.rec.stop();
   }
@@ -774,6 +810,7 @@ function exitStudio() {
 
   if (localStream) localStream.getTracks().forEach(t => t.stop());
   clearInterval(timerInterval);
+  clearRecSinks();
 
   document.body.innerHTML = '<div style="background:#0A0A0A;color:#444;font-family:\'DM Mono\',monospace;height:100vh;display:flex;align-items:center;justify-content:center;font-size:11px;letter-spacing:.14em;">SESSION ENDED</div>';
 }
